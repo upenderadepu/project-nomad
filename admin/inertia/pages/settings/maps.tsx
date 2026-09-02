@@ -6,26 +6,31 @@ import { useModals } from '~/context/ModalContext'
 import StyledModal from '~/components/StyledModal'
 import { FileEntry } from '../../../types/files'
 import { useNotifications } from '~/context/NotificationContext'
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import api from '~/lib/api'
 import DownloadURLModal from '~/components/DownloadURLModal'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import useDownloads from '~/hooks/useDownloads'
 import StyledSectionHeader from '~/components/StyledSectionHeader'
 import CuratedCollectionCard from '~/components/CuratedCollectionCard'
+import CountryPickerModal from '~/components/CountryPickerModal'
 import type { CollectionWithStatus } from '../../../types/collections'
 import ActiveDownloads from '~/components/ActiveDownloads'
 import Alert from '~/components/Alert'
+import { formatBytes } from '~/lib/util'
+import { hasDownloadedGlobalMap } from '~/lib/global_map_banner'
 
 const CURATED_COLLECTIONS_KEY = 'curated-map-collections'
+const GLOBAL_MAP_INFO_KEY = 'global-map-info'
 
 export default function MapsManager(props: {
-  maps: { baseAssetsExist: boolean; regionFiles: FileEntry[] }
+  maps: { baseAssetsExist: boolean; worldBasemapExists: boolean; regionFiles: FileEntry[] }
 }) {
   const queryClient = useQueryClient()
   const { openModal, closeAllModals } = useModals()
   const { addNotification } = useNotifications()
   const [downloading, setDownloading] = useState(false)
+  const [deletingFileKey, setDeletingFileKey] = useState<string | null>(null)
 
   const { data: curatedCollections } = useQuery({
     queryKey: [CURATED_COLLECTIONS_KEY],
@@ -33,9 +38,64 @@ export default function MapsManager(props: {
     refetchOnWindowFocus: false,
   })
 
-  const { invalidate: invalidateDownloads } = useDownloads({
+  const { data: activeMapDownloads = [], invalidate: invalidateDownloads } = useDownloads({
     filetype: 'map',
     enabled: true,
+  })
+
+  // Refresh the Stored Map Files list when a map download finishes. We pass props.maps.regionFiles
+  // straight through from the server-side render, so without an Inertia partial reload it stays stale
+  // until the user navigates away and back.
+  const prevMapDownloadCountRef = useRef(activeMapDownloads.length)
+  useEffect(() => {
+    if (activeMapDownloads.length < prevMapDownloadCountRef.current) {
+      router.reload({ only: ['maps'] })
+    }
+    prevMapDownloadCountRef.current = activeMapDownloads.length
+  }, [activeMapDownloads.length])
+
+  const { data: globalMapInfo } = useQuery({
+    queryKey: [GLOBAL_MAP_INFO_KEY],
+    queryFn: () => api.getGlobalMapInfo(),
+    refetchOnWindowFocus: false,
+  })
+  const globalMapAlreadyDownloaded = hasDownloadedGlobalMap(globalMapInfo?.key, props.maps.regionFiles)
+
+  const setupWorldBasemap = useMutation({
+    mutationFn: () => api.setupWorldBasemap(),
+    onSuccess: () => {
+      addNotification({
+        type: 'success',
+        message: 'Base map downloaded successfully.',
+      })
+      router.reload({ only: ['maps'] })
+    },
+    onError: () => {
+      addNotification({
+        type: 'error',
+        message:
+          'Could not download the base map. Please connect this NOMAD to the internet and try again.',
+      })
+    },
+  })
+
+  const downloadGlobalMap = useMutation({
+    mutationFn: () => api.downloadGlobalMap(),
+    onSuccess: () => {
+      invalidateDownloads()
+      addNotification({
+        type: 'success',
+        message: 'Global map download has been queued. This is a large file (~125 GB) and may take a while.',
+      })
+      closeAllModals()
+    },
+    onError: (error) => {
+      console.error('Error downloading global map:', error)
+      addNotification({
+        type: 'error',
+        message: 'Failed to start the global map download. Please try again.',
+      })
+    },
   })
 
   async function downloadBaseAssets() {
@@ -91,18 +151,40 @@ export default function MapsManager(props: {
     }
   }
 
+  async function deleteFile(file: FileEntry) {
+    if (file.type !== 'file') return
+
+    try {
+      setDeletingFileKey(file.key)
+      await api.deleteMapRegionFile(file.name)
+      addNotification({
+        type: 'success',
+        message: `${file.name} has been deleted.`,
+      })
+      closeAllModals()
+      router.reload({ only: ['maps'] })
+    } catch (error) {
+      console.error('Error deleting map file:', error)
+      addNotification({
+        type: 'error',
+        message: `Failed to delete ${file.name}. Please try again.`,
+      })
+    } finally {
+      setDeletingFileKey(null)
+    }
+  }
+
   async function confirmDeleteFile(file: FileEntry) {
     openModal(
       <StyledModal
         title="Confirm Delete?"
-        onConfirm={() => {
-          closeAllModals()
-        }}
+        onConfirm={() => deleteFile(file)}
         onCancel={closeAllModals}
         open={true}
         confirmText="Delete"
         cancelText="Cancel"
         confirmVariant="danger"
+        confirmLoading={file.type === 'file' && deletingFileKey === file.key}
       >
         <p className="text-text-secondary">
           Are you sure you want to delete {file.name}? This action cannot be undone.
@@ -143,6 +225,47 @@ export default function MapsManager(props: {
         </p>
       </StyledModal>,
       'confirm-download-file-modal'
+    )
+  }
+
+  async function confirmGlobalMapDownload() {
+    if (!globalMapInfo) return
+    openModal(
+      <StyledModal
+        title="Download Global Map?"
+        onConfirm={() => downloadGlobalMap.mutate()}
+        onCancel={closeAllModals}
+        open={true}
+        confirmText="Download"
+        cancelText="Cancel"
+        confirmVariant="primary"
+        confirmLoading={downloadGlobalMap.isPending}
+      >
+        <p className="text-text-secondary">
+          This will download the full Protomaps global map ({formatBytes(globalMapInfo.size, 1)}, build {globalMapInfo.date}).
+          Covers the entire planet so you won't need individual region files.
+          Make sure you have enough disk space.
+        </p>
+      </StyledModal>,
+      'confirm-global-map-download-modal'
+    )
+  }
+
+  function openCountryPickerModal() {
+    openModal(
+      <CountryPickerModal
+        onCancel={closeAllModals}
+        installedFilenames={(props.maps.regionFiles ?? []).map((f) => f.name)}
+        onDownloadStart={() => {
+          invalidateDownloads()
+          addNotification({
+            type: 'success',
+            message: 'Download queued. Watch progress below.',
+          })
+          closeAllModals()
+        }}
+      />,
+      'country-picker-modal'
     )
   }
 
@@ -201,6 +324,70 @@ export default function MapsManager(props: {
               }}
             />
           )}
+          {props.maps.baseAssetsExist && !props.maps.worldBasemapExists && (
+            <Alert
+              title="World base map not downloaded"
+              message="The low-zoom world base map (~15 MB) hasn't been downloaded yet, so the map appears blank outside any regions you've downloaded. Connect this NOMAD to the internet and download it once for offline use."
+              type="warning"
+              variant="solid"
+              className="my-4"
+              buttonProps={{
+                variant: 'secondary',
+                children: 'Download Base Map',
+                icon: 'IconCloudDownload',
+                loading: setupWorldBasemap.isPending,
+                onClick: () => setupWorldBasemap.mutate(),
+              }}
+            />
+          )}
+          {globalMapInfo && globalMapAlreadyDownloaded && (
+            <Alert
+              title="Global Map Installed"
+              message={`Your global map build ${globalMapInfo.date} (${formatBytes(globalMapInfo.size, 1)}) is stored locally and ready for offline use.`}
+              type="success"
+              variant="bordered"
+              className="mt-8"
+              icon="IconCircleCheck"
+              buttonProps={{
+                variant: 'secondary',
+                children: 'Download latest build',
+                icon: 'IconRefresh',
+                onClick: () => confirmGlobalMapDownload(),
+              }}
+            />
+          )}
+          {globalMapInfo && !globalMapAlreadyDownloaded && (
+            <Alert
+              title="Global Map Coverage Available"
+              message={`Download a complete worldwide map from Protomaps (${formatBytes(globalMapInfo.size, 1)}, build ${globalMapInfo.date}). This is a large file but covers the entire planet — no individual region downloads needed.`}
+              type="info-inverted"
+              variant="bordered"
+              className="mt-8"
+              icon="IconWorld"
+              buttonProps={{
+                variant: 'primary',
+                children: 'Download Global Map',
+                icon: 'IconCloudDownload',
+                loading: downloadGlobalMap.isPending,
+                onClick: () => confirmGlobalMapDownload(),
+              }}
+            />
+          )}
+          <Alert
+            title="Download by country or region"
+            message="Pick the countries you actually need — from a single country to a whole continent — and we'll pull just those tiles from the global Protomaps archive. Much smaller than the full 125 GB global map."
+            type="info-inverted"
+            variant="bordered"
+            className="mt-8"
+            icon="IconMap2"
+            buttonProps={{
+              variant: 'primary',
+              children: 'Choose Countries',
+              icon: 'IconMap2',
+              onClick: openCountryPickerModal,
+            }}
+          />
+
           <div className="mt-8 mb-6 flex items-center justify-between">
             <StyledSectionHeader title="Curated Map Regions" className="!mb-0" />
             <StyledButton

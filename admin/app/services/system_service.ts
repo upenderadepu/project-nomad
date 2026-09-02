@@ -1,57 +1,90 @@
 import Service from '#models/service'
+import InstalledResource from '#models/installed_resource'
 import { inject } from '@adonisjs/core'
 import { DockerService } from '#services/docker_service'
 import { ServiceSlim } from '../../types/services.js'
 import logger from '@adonisjs/core/services/logger'
 import si from 'systeminformation'
-import { GpuHealthStatus, NomadDiskInfo, NomadDiskInfoRaw, SystemInformationResponse } from '../../types/system.js'
+import {
+  GpuHealthStatus,
+  NomadDiskInfo,
+  NomadDiskInfoRaw,
+  SystemInformationResponse,
+} from '../../types/system.js'
 import { SERVICE_NAMES } from '../../constants/service_names.js'
-import { readFileSync } from 'fs'
-import path, { join } from 'path'
+import { readFileSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
+import path, { join } from 'node:path'
 import { getAllFilesystems, getFile } from '../utils/fs.js'
 import axios from 'axios'
 import env from '#start/env'
 import KVStore from '#models/kv_store'
 import { KV_STORE_SCHEMA, KVStoreKey } from '../../types/kv_store.js'
 import { isNewerVersion } from '../utils/version.js'
-
+import { invalidateAssistantNameCache } from '../../config/inertia.js'
+import { KiwixLibraryService } from '#services/kiwix_library_service'
 
 @inject()
 export class SystemService {
   private static appVersion: string | null = null
   private static diskInfoFile = '/storage/nomad-disk-info.json'
 
-  constructor(private dockerService: DockerService) { }
+  constructor(private dockerService: DockerService) {}
 
   async checkServiceInstalled(serviceName: string): Promise<boolean> {
-    const services = await this.getServices({ installedOnly: true });
-    return services.some(service => service.service_name === serviceName);
+    const services = await this.getServices({ installedOnly: true })
+    return services.some((service) => service.service_name === serviceName)
   }
 
   async getInternetStatus(): Promise<boolean> {
-    const DEFAULT_TEST_URL = 'https://1.1.1.1/cdn-cgi/trace'
+    // Primary endpoint stays Cloudflare's privacy-respecting utility endpoint.
+    // The fallbacks are hosts the application already contacts elsewhere
+    // (GitHub API for update checks, the Project NOMAD API for release-note
+    // subscriptions), so no new third-party services are introduced. They exist
+    // to avoid false "offline" reports on networks that block 1.1.1.1.
+    const DEFAULT_TEST_URLS = [
+      'https://1.1.1.1/cdn-cgi/trace',
+      'https://api.github.com',
+      'https://api.projectnomad.us',
+    ]
     const MAX_ATTEMPTS = 3
 
-    let testUrl = DEFAULT_TEST_URL
-    let customTestUrl = env.get('INTERNET_STATUS_TEST_URL')?.trim()
+    let testUrls = DEFAULT_TEST_URLS
 
-    // check that customTestUrl is a valid URL, if provided
+    // Resolve the test endpoint in priority order: the INTERNET_STATUS_TEST_URL
+    // env var always wins (legacy override for operators who intentionally point
+    // connectivity checks at a specific endpoint), then the UI-configurable value
+    // stored in KVStore, and finally the built-in defaults.
+    const envTestUrl = env.get('INTERNET_STATUS_TEST_URL')?.trim()
+    const kvTestUrl = (await KVStore.getValue('system.internetStatusTestUrl'))?.trim()
+    const customTestUrl = envTestUrl || kvTestUrl
+
+    // If a custom test URL is provided and valid, use it exclusively.
     if (customTestUrl && customTestUrl !== '') {
       try {
         new URL(customTestUrl)
-        testUrl = customTestUrl
+        testUrls = [customTestUrl]
       } catch (error) {
         logger.warn(
-          `Invalid INTERNET_STATUS_TEST_URL: ${customTestUrl}. Falling back to default URL.`
+          `Invalid internet status test URL: ${customTestUrl}. Falling back to default URLs.`
         )
       }
     }
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       try {
-        const res = await axios.get(testUrl, { timeout: 5000 })
-        return res.status === 200
+        // Probe all test endpoints in parallel and resolve as soon as the first one
+        // responds. Any HTTP response (including non-2xx) means we reached the
+        // internet, so accept all status codes rather than requiring a strict 200.
+        await Promise.any(
+          testUrls.map((testUrl) => {
+            logger.debug(`[SystemService] Checking internet connectivity via: ${testUrl}`)
+            return axios.get(testUrl, { timeout: 5000, validateStatus: () => true })
+          })
+        )
+        return true
       } catch (error) {
+        // Promise.any only rejects (with an AggregateError) when every endpoint failed.
         logger.warn(
           `Internet status check attempt ${attempt}/${MAX_ATTEMPTS} failed: ${error instanceof Error ? error.message : error}`
         )
@@ -67,14 +100,103 @@ export class SystemService {
     return false
   }
 
-  async getNvidiaSmiInfo(): Promise<Array<{ vendor: string; model: string; vram: number; }> | { error: string } | 'OLLAMA_NOT_FOUND' | 'BAD_RESPONSE' | 'UNKNOWN_ERROR'> {
+  /**
+   * Probe Ollama startup logs for the canonical "inference compute" line that records
+   * which compute backend was selected. This catches silent CPU fallback (e.g. when
+   * /dev/kfd is mounted but ROCm initialization fails, or NVML dies after an update)
+   * which the older nvidia-smi exec probe could not detect.
+   *
+   * Returns the parsed library, GPU model name, and VRAM in MiB, or null when:
+   *   - the Ollama container is not running
+   *   - the line has not been emitted (Ollama still starting up)
+   *   - logs show CPU-only operation (no GPU detected)
+   */
+  async getOllamaInferenceComputeFromLogs(): Promise<{
+    library: 'CUDA' | 'ROCm'
+    name: string
+    vramMiB: number
+  } | null> {
     try {
       const containers = await this.dockerService.docker.listContainers({ all: false })
-      const ollamaContainer = containers.find((c) =>
-        c.Names.includes(`/${SERVICE_NAMES.OLLAMA}`)
+      const ollamaContainer = containers.find((c) => c.Names.includes(`/${SERVICE_NAMES.OLLAMA}`))
+      if (!ollamaContainer) return null
+
+      const container = this.dockerService.docker.getContainer(ollamaContainer.Id)
+
+      // Read logs only from the first 5 minutes after container start. The
+      // "inference compute" line is written once during Ollama's GPU discovery
+      // phase, within seconds of startup. Using tail:N here is fragile: under
+      // active embedding workloads we've seen >1000 lines/min, which pushes the
+      // line past any reasonable tail in minutes. Pinning to the startup window
+      // is bounded (~5 min of logs regardless of container uptime) and never
+      // ages out.
+      //
+      // Fall back to the previous tail:500 strategy if StartedAt is missing or
+      // unparseable — we can't construct a since/until window without it, but
+      // tail:500 is still useful when the container just started and the line
+      // is still recent.
+      const inspect = await container.inspect()
+      const startedAtRaw = inspect?.State?.StartedAt
+      const startedAtMs = startedAtRaw ? new Date(startedAtRaw).getTime() : NaN
+      const hasValidStartedAt = Number.isFinite(startedAtMs) && startedAtMs > 0
+
+      const logsOpts: { stdout: true; stderr: true; follow: false; since?: number; until?: number; tail?: number } = {
+        stdout: true,
+        stderr: true,
+        follow: false,
+      }
+      if (hasValidStartedAt) {
+        const startedAtSec = Math.floor(startedAtMs / 1000)
+        logsOpts.since = startedAtSec
+        logsOpts.until = startedAtSec + 300 // 5-minute window
+      } else {
+        logger.warn(
+          `[SystemService] nomad_ollama State.StartedAt missing or invalid (${startedAtRaw ?? 'undefined'}); falling back to tail:500 for inference-compute probe`
+        )
+        logsOpts.tail = 500
+      }
+      const buf = (await container.logs(logsOpts)) as unknown as Buffer
+      const logs = buf.toString('utf8')
+
+      const lines = logs.split('\n').filter((l) => l.includes('msg="inference compute"'))
+      if (lines.length === 0) return null
+
+      const lastLine = lines[lines.length - 1]
+      const libraryMatch = lastLine.match(/library=(CUDA|ROCm)/)
+      if (!libraryMatch) return null
+
+      const descMatch = lastLine.match(/description="([^"]+)"/)
+      const totalMatch = lastLine.match(/total="([0-9.]+)\s*GiB"/)
+
+      return {
+        library: libraryMatch[1] as 'CUDA' | 'ROCm',
+        name:
+          descMatch?.[1] ||
+          (libraryMatch[1] === 'CUDA' ? 'NVIDIA GPU' : 'AMD GPU'),
+        vramMiB: totalMatch ? Math.round(Number.parseFloat(totalMatch[1]) * 1024) : 0,
+      }
+    } catch (error) {
+      logger.warn(
+        `[SystemService] Failed to probe Ollama logs for inference compute line: ${error instanceof Error ? error.message : error}`
       )
+      return null
+    }
+  }
+
+  async getNvidiaSmiInfo(): Promise<
+    | Array<{ vendor: string; model: string; vram: number }>
+    | { error: string }
+    | 'OLLAMA_NOT_FOUND'
+    | 'BAD_RESPONSE'
+    | 'UNKNOWN_ERROR'
+  > {
+    try {
+      const containers = await this.dockerService.docker.listContainers({ all: false })
+      const ollamaContainer = containers.find((c) => c.Names.includes(`/${SERVICE_NAMES.OLLAMA}`))
       if (!ollamaContainer) {
-        logger.info('Ollama container not found for nvidia-smi info retrieval. This is expected if Ollama is not installed.')
+        logger.info(
+          'Ollama container not found for nvidia-smi info retrieval. This is expected if Ollama is not installed.'
+        )
         return 'OLLAMA_NOT_FOUND'
       }
 
@@ -92,23 +214,35 @@ export class SystemService {
       const output = await new Promise<string>((resolve) => {
         let data = ''
         const timeout = setTimeout(() => resolve(data), 5000)
-        stream.on('data', (chunk: Buffer) => { data += chunk.toString() })
-        stream.on('end', () => { clearTimeout(timeout); resolve(data) })
+        stream.on('data', (chunk: Buffer) => {
+          data += chunk.toString()
+        })
+        stream.on('end', () => {
+          clearTimeout(timeout)
+          resolve(data)
+        })
       })
 
       // Remove any non-printable characters and trim the output
-      const cleaned = output.replace(/[\x00-\x08]/g, '').trim()
-      if (cleaned && !cleaned.toLowerCase().includes('error') && !cleaned.toLowerCase().includes('not found')) {
+      const cleaned = Array.from(output)
+        .filter((character) => character.charCodeAt(0) > 8)
+        .join('')
+        .trim()
+      if (
+        cleaned &&
+        !cleaned.toLowerCase().includes('error') &&
+        !cleaned.toLowerCase().includes('not found')
+      ) {
         // Split by newlines to handle multiple GPUs installed
-        const lines = cleaned.split('\n').filter(line => line.trim())
+        const lines = cleaned.split('\n').filter((line) => line.trim())
 
         // Map each line out to a useful structure for us
-        const gpus = lines.map(line => {
+        const gpus = lines.map((line) => {
           const parts = line.split(',').map((s) => s.trim())
           return {
             vendor: 'NVIDIA',
             model: parts[0] || 'NVIDIA GPU',
-            vram: parts[1] ? parseInt(parts[1], 10) : 0,
+            vram: parts[1] ? Number.parseInt(parts[1], 10) : 0,
           }
         })
 
@@ -117,8 +251,7 @@ export class SystemService {
 
       // If we got output but looks like an error, consider it a bad response from nvidia-smi
       return 'BAD_RESPONSE'
-    }
-    catch (error) {
+    } catch (error) {
       logger.error('Error getting nvidia-smi info:', error)
       if (error instanceof Error && error.message) {
         return { error: error.message }
@@ -127,8 +260,65 @@ export class SystemService {
     }
   }
 
+  async getExternalOllamaGpuInfo(): Promise<Array<{
+    vendor: string
+    model: string
+    vram: number
+  }> | null> {
+    try {
+      // If a remote Ollama URL is configured, use it directly without requiring a local container
+      const remoteOllamaUrl = await KVStore.getValue('ai.remoteOllamaUrl')
+      if (!remoteOllamaUrl) {
+        const containers = await this.dockerService.docker.listContainers({ all: false })
+        const ollamaContainer = containers.find((c) => c.Names.includes(`/${SERVICE_NAMES.OLLAMA}`))
+        if (!ollamaContainer) {
+          return null
+        }
+
+        const actualImage = (ollamaContainer.Image || '').toLowerCase()
+        if (actualImage.includes('ollama/ollama') || actualImage.startsWith('ollama:')) {
+          return null
+        }
+      }
+
+      const ollamaUrl = remoteOllamaUrl || (await this.dockerService.getServiceURL(SERVICE_NAMES.OLLAMA))
+      if (!ollamaUrl) {
+        return null
+      }
+
+      await axios.get(new URL('/api/tags', ollamaUrl).toString(), { timeout: 3000 })
+
+      let vramMb = 0
+      try {
+        const psResponse = await axios.get(new URL('/api/ps', ollamaUrl).toString(), {
+          timeout: 3000,
+        })
+        const loadedModels = Array.isArray(psResponse.data?.models) ? psResponse.data.models : []
+        const largestAllocation = loadedModels.reduce(
+          (max: number, model: { size_vram?: number | string }) =>
+            Math.max(max, Number(model.size_vram) || 0),
+          0
+        )
+        vramMb = largestAllocation > 0 ? Math.round(largestAllocation / (1024 * 1024)) : 0
+      } catch {}
+
+      return [
+        {
+          vendor: 'NVIDIA',
+          model: 'NVIDIA GPU (external Ollama)',
+          vram: vramMb,
+        },
+      ]
+    } catch (error) {
+      logger.info(
+        `[SystemService] External Ollama GPU probe failed: ${error instanceof Error ? error.message : error}`
+      )
+      return null
+    }
+  }
+
   async getServices({ installedOnly = true }: { installedOnly?: boolean }): Promise<ServiceSlim[]> {
-    await this._syncContainersWithDatabase() // Sync up before fetching to ensure we have the latest status
+    const statuses = await this._syncContainersWithDatabase() // Sync and reuse the fetched status list
 
     const query = Service.query()
       .orderBy('display_order', 'asc')
@@ -139,15 +329,26 @@ export class SystemService {
         'installed',
         'installation_status',
         'ui_location',
+        'custom_url',
         'friendly_name',
         'description',
         'icon',
         'powered_by',
         'display_order',
         'container_image',
-        'available_update_version'
+        'available_update_version',
+        'auto_update_enabled',
+        'is_custom',
+        'is_user_modified',
+        'is_deprecated',
+        'category'
       )
       .where('is_dependency_service', false)
+      // Deprecated/sunset apps stay visible only while still installed, so the user can manage and
+      // uninstall them — they never reappear in the install catalog once removed.
+      .where((q) => {
+        q.where('is_deprecated', false).orWhere('installed', true)
+      })
     if (installedOnly) {
       query.where('installed', true)
     }
@@ -156,8 +357,6 @@ export class SystemService {
     if (!services || services.length === 0) {
       return []
     }
-
-    const statuses = await this.dockerService.getServicesStatus()
 
     const toReturn: ServiceSlim[] = []
 
@@ -173,10 +372,16 @@ export class SystemService {
         installation_status: service.installation_status,
         status: status ? status.status : 'unknown',
         ui_location: service.ui_location || '',
+        custom_url: service.custom_url,
         powered_by: service.powered_by,
         display_order: service.display_order,
         container_image: service.container_image,
         available_update_version: service.available_update_version,
+        auto_update_enabled: service.auto_update_enabled,
+        is_custom: service.is_custom,
+        is_user_modified: service.is_user_modified,
+        is_deprecated: service.is_deprecated,
+        category: service.category,
       })
     }
 
@@ -240,10 +445,14 @@ export class SystemService {
         logger.error('Error reading disk info file:', error)
       }
 
-      // GPU health tracking — detect when host has NVIDIA GPU but Ollama can't access it
+      // GPU health tracking — detect when host has a GPU runtime but Ollama can't access it.
+      // Primary probe: parse Ollama's "inference compute" startup log line for both NVIDIA
+      // and AMD. Secondary probe (NVIDIA only): nvidia-smi exec, retained as a fallback for
+      // hardware enrichment when log parsing has not yet captured a startup line.
       let gpuHealth: GpuHealthStatus = {
         status: 'no_gpu',
         hasNvidiaRuntime: false,
+        hasRocmRuntime: false,
         ollamaGpuAccessible: false,
       }
 
@@ -262,28 +471,155 @@ export class SystemService {
           os.kernel = dockerInfo.KernelVersion
         }
 
-        // If si.graphics() returned no controllers (common inside Docker),
-        // fall back to nvidia runtime + nvidia-smi detection
-        if (!graphics.controllers || graphics.controllers.length === 0) {
+        // si.graphics() in the admin container uses lspci (pciutils ships in
+        // the image for AMD detection). lspci has no real VRAM info for
+        // discrete GPUs, so systeminformation parses the first PCI memory
+        // Region (BAR0, typically 1-32 MiB) as `vram`. nvidia-smi / ROCm
+        // tooling enrichment also can't run since neither is in the admin
+        // image. No real dGPU has under 256 MiB, so any discrete-GPU controller
+        // below that threshold needs the probes below to give us real data.
+        // Applies to both NVIDIA and AMD; Intel iGPUs are exempt because their
+        // shared-system-memory VRAM reading via lspci can legitimately be small.
+        const DGPU_BOGUS_VRAM_THRESHOLD_MIB = 256
+        const isDiscreteGpuVendor = (vendor: string) =>
+          /nvidia|advanced micro devices|amd|ati/i.test(vendor)
+        const isBogusDgpuVram = (c: { vendor?: string; vram?: number | null }) =>
+          isDiscreteGpuVendor(c.vendor || '') &&
+          typeof c.vram === 'number' &&
+          c.vram < DGPU_BOGUS_VRAM_THRESHOLD_MIB
+
+        // Clear the bogus value up front. If a probe replaces the entry below
+        // we get the real VRAM; if no probe succeeds (Ollama not installed,
+        // passthrough_failed) the UI falls back to "N/A" instead of showing
+        // "1 MB" / "32 MB". The lspci model/vendor strings stay since they're
+        // still useful for identifying the card.
+        const hasLspciBogusDgpuVram = (graphics.controllers || []).some(isBogusDgpuVram)
+        if (hasLspciBogusDgpuVram) {
+          for (const c of graphics.controllers) {
+            if (isBogusDgpuVram(c)) c.vram = null
+          }
+        }
+
+        // Run the probes when controllers are empty (common inside Docker) or
+        // when lspci gave us bogus discrete-GPU BAR0 values that need replacing.
+        if (
+          !graphics.controllers ||
+          graphics.controllers.length === 0 ||
+          hasLspciBogusDgpuVram
+        ) {
           const runtimes = dockerInfo.Runtimes || {}
-          if ('nvidia' in runtimes) {
-            gpuHealth.hasNvidiaRuntime = true
-            const nvidiaInfo = await this.getNvidiaSmiInfo()
-            if (Array.isArray(nvidiaInfo)) {
-              graphics.controllers = nvidiaInfo.map((gpu) => ({
-                model: gpu.model,
-                vendor: gpu.vendor,
-                bus: "",
-                vram: gpu.vram,
-                vramDynamic: false, // assume false here, we don't actually use this field for our purposes.
-              }))
+          gpuHealth.hasNvidiaRuntime = 'nvidia' in runtimes
+
+          // AMD doesn't register a Docker runtime. Detection sources, in priority order:
+          //   1. KV 'gpu.type' (set by DockerService._detectGPUType after first Ollama install)
+          //   2. Marker file at /app/storage/.nomad-gpu-type (written by install_nomad.sh)
+          // The marker file matters because the System page should reflect AMD presence
+          // even before AI Assistant has been installed for the first time.
+          let savedGpuType: string | null | undefined = await KVStore.getValue('gpu.type') as string | undefined
+          if (!savedGpuType) {
+            try {
+              savedGpuType = (await readFile('/app/storage/.nomad-gpu-type', 'utf8')).trim()
+            } catch {}
+          }
+          const amdEnabledRaw = await KVStore.getValue('ai.amdGpuAcceleration')
+          const amdAccelerationEnabled = String(amdEnabledRaw) !== 'false'
+          gpuHealth.hasRocmRuntime = savedGpuType === 'amd' && amdAccelerationEnabled
+
+          if (gpuHealth.hasNvidiaRuntime || gpuHealth.hasRocmRuntime) {
+            gpuHealth.gpuVendor = gpuHealth.hasNvidiaRuntime ? 'nvidia' : 'amd'
+
+            // Primary probe: Ollama log parsing — works for both vendors and catches silent fallback
+            const logInfo = await this.getOllamaInferenceComputeFromLogs()
+            if (logInfo) {
+              graphics.controllers = [
+                {
+                  model: logInfo.name,
+                  vendor: logInfo.library === 'CUDA' ? 'NVIDIA' : 'AMD',
+                  bus: '',
+                  vram: logInfo.vramMiB,
+                  vramDynamic: false,
+                },
+              ]
               gpuHealth.status = 'ok'
               gpuHealth.ollamaGpuAccessible = true
-            } else if (nvidiaInfo === 'OLLAMA_NOT_FOUND') {
-              gpuHealth.status = 'ollama_not_installed'
+            } else if (gpuHealth.hasNvidiaRuntime) {
+              // NVIDIA secondary path: nvidia-smi exec preserves prior behavior when
+              // the log parser hasn't seen a startup line yet (e.g. log rotation,
+              // very fresh container). Distinguishes "no Ollama container" from
+              // "container exists but GPU broken".
+              const nvidiaInfo = await this.getNvidiaSmiInfo()
+              if (Array.isArray(nvidiaInfo)) {
+                graphics.controllers = nvidiaInfo.map((gpu) => ({
+                  model: gpu.model,
+                  vendor: gpu.vendor,
+                  bus: '',
+                  vram: gpu.vram,
+                  vramDynamic: false,
+                }))
+                gpuHealth.status = 'ok'
+                gpuHealth.ollamaGpuAccessible = true
+              } else if (nvidiaInfo === 'OLLAMA_NOT_FOUND') {
+                const externalOllamaGpu = await this.getExternalOllamaGpuInfo()
+                if (externalOllamaGpu) {
+                  graphics.controllers = externalOllamaGpu.map((gpu) => ({
+                    model: gpu.model,
+                    vendor: gpu.vendor,
+                    bus: '',
+                    vram: gpu.vram,
+                    vramDynamic: false,
+                  }))
+                  gpuHealth.status = 'ok'
+                  gpuHealth.ollamaGpuAccessible = true
+                } else {
+                  gpuHealth.status = 'ollama_not_installed'
+                }
+              } else {
+                const externalOllamaGpu = await this.getExternalOllamaGpuInfo()
+                if (externalOllamaGpu) {
+                  graphics.controllers = externalOllamaGpu.map((gpu) => ({
+                    model: gpu.model,
+                    vendor: gpu.vendor,
+                    bus: '',
+                    vram: gpu.vram,
+                    vramDynamic: false,
+                  }))
+                  gpuHealth.status = 'ok'
+                  gpuHealth.ollamaGpuAccessible = true
+                } else {
+                  gpuHealth.status = 'passthrough_failed'
+                  logger.warn(
+                    `NVIDIA runtime detected but GPU passthrough failed: ${typeof nvidiaInfo === 'string' ? nvidiaInfo : JSON.stringify(nvidiaInfo)}`
+                  )
+                }
+              }
             } else {
-              gpuHealth.status = 'passthrough_failed'
-              logger.warn(`NVIDIA runtime detected but GPU passthrough failed: ${typeof nvidiaInfo === 'string' ? nvidiaInfo : JSON.stringify(nvidiaInfo)}`)
+              // AMD path: no nvidia-smi equivalent worth running — log parser is authoritative.
+              // Distinguish "Ollama not running" from "Ollama running but no GPU log line".
+              const containers = await this.dockerService.docker.listContainers({ all: false })
+              const ollamaRunning = containers.some((c) =>
+                c.Names.includes(`/${SERVICE_NAMES.OLLAMA}`)
+              )
+              if (!ollamaRunning) {
+                const externalOllamaGpu = await this.getExternalOllamaGpuInfo()
+                if (externalOllamaGpu) {
+                  graphics.controllers = externalOllamaGpu.map((gpu) => ({
+                    model: gpu.model,
+                    vendor: gpu.vendor,
+                    bus: '',
+                    vram: gpu.vram,
+                    vramDynamic: false,
+                  }))
+                  gpuHealth.status = 'ok'
+                  gpuHealth.ollamaGpuAccessible = true
+                } else {
+                  gpuHealth.status = 'ollama_not_installed'
+                }
+              } else {
+                gpuHealth.status = 'passthrough_failed'
+                logger.warn(
+                  'AMD GPU detected but Ollama logs show no ROCm initialization — passthrough or HSA override may have failed'
+                )
+              }
             }
           }
         } else {
@@ -356,9 +692,10 @@ export class SystemService {
 
       logger.info(`Current version: ${currentVersion}, Latest version: ${latestVersion}`)
 
-      const updateAvailable = process.env.NODE_ENV === 'development'
-        ? false
-        : isNewerVersion(latestVersion, currentVersion.trim(), earlyAccess)
+      const updateAvailable =
+        process.env.NODE_ENV === 'development'
+          ? false
+          : isNewerVersion(latestVersion, currentVersion.trim(), earlyAccess)
 
       // Cache the results in KVStore for frontend checks
       await KVStore.setValue('system.updateAvailable', updateAvailable)
@@ -421,6 +758,28 @@ export class SystemService {
       this.checkLatestVersion().catch(() => null),
     ])
 
+    // Diagnostics tied to common support cases: storage relocation (#1050),
+    // container/updater issues (#858), GPU passthrough (#755/#878), and the
+    // auto-update trilogy. All best-effort so a single failure never blanks the
+    // whole bundle.
+    const [dockerVersion, hostStorageRoot, kiwixBookCount, gpuType] = await Promise.all([
+      this.dockerService.docker
+        .version()
+        .then((v: any) => v?.Version ?? null)
+        .catch(() => null),
+      this.dockerService.getHostStorageRoot().catch(() => null),
+      new KiwixLibraryService().getBookCount().catch(() => null),
+      KVStore.getValue('gpu.type').catch(() => null),
+    ])
+    const [autoUpdateCore, autoUpdateApps, autoUpdateContent, autoDisabledReason] =
+      await Promise.all([
+        KVStore.getValue('autoUpdate.enabled').catch(() => null),
+        KVStore.getValue('appAutoUpdate.enabled').catch(() => null),
+        KVStore.getValue('contentAutoUpdate.enabled').catch(() => null),
+        KVStore.getValue('autoUpdate.autoDisabledReason').catch(() => null),
+      ])
+    const isEnabled = (v: any) => v === true || v === 'true'
+
     const lines: string[] = [
       'Project NOMAD Debug Info',
       '========================',
@@ -429,7 +788,7 @@ export class SystemService {
     ]
 
     if (systemInfo) {
-      const { cpu, mem, os, disk, fsSize, uptime, graphics } = systemInfo
+      const { cpu, mem, os, disk, fsSize, uptime, graphics, gpuHealth } = systemInfo
 
       lines.push('')
       lines.push('System:')
@@ -437,6 +796,7 @@ export class SystemService {
       if (os.hostname) lines.push(`  Hostname: ${os.hostname}`)
       if (os.kernel) lines.push(`  Kernel: ${os.kernel}`)
       if (os.arch) lines.push(`  Architecture: ${os.arch}`)
+      if (dockerVersion) lines.push(`  Docker Engine: ${dockerVersion}`)
       if (uptime?.uptime) lines.push(`  Uptime: ${this._formatUptime(uptime.uptime)}`)
 
       lines.push('')
@@ -458,6 +818,10 @@ export class SystemService {
       } else {
         lines.push('  GPU: None detected')
       }
+      if (gpuHealth?.status) {
+        const vendor = gpuType || gpuHealth.gpuVendor
+        lines.push(`  GPU Passthrough: ${gpuHealth.status}${vendor ? ` (${vendor})` : ''}`)
+      }
 
       // Disk info — try disk array first, fall back to fsSize
       const diskEntries = disk.filter((d) => d.totalSize > 0)
@@ -476,6 +840,20 @@ export class SystemService {
           lines.push(`  Disk: ${this._formatBytes(f.size)}, ${Math.round(f.use)}% used`)
         }
       }
+    }
+
+    lines.push('')
+    lines.push('Storage:')
+    lines.push(`  Host storage root: ${hostStorageRoot ?? 'unknown'}`)
+    lines.push(`  Container path: ${DockerService.ADMIN_STORAGE_DEST}`)
+    const storageEnv = process.env.NOMAD_STORAGE_PATH
+    lines.push(
+      `  NOMAD_STORAGE_PATH: ${storageEnv ? storageEnv : 'not set (auto-detected from admin mount)'}`
+    )
+    if (kiwixBookCount !== null) {
+      lines.push(
+        `  Kiwix library: ${kiwixBookCount === 0 ? 'empty (0 books)' : `${kiwixBookCount} book(s)`}`
+      )
     }
 
     const installed = services.filter((s) => s.installed)
@@ -501,6 +879,15 @@ export class SystemService {
       lines.push(`Update Available: ${updateMsg}`)
     }
 
+    lines.push('')
+    lines.push('Auto-Update:')
+    lines.push(`  Core: ${isEnabled(autoUpdateCore) ? 'Enabled' : 'Disabled'}`)
+    lines.push(`  Apps: ${isEnabled(autoUpdateApps) ? 'Enabled' : 'Disabled'}`)
+    lines.push(`  Content: ${isEnabled(autoUpdateContent) ? 'Enabled' : 'Disabled'}`)
+    if (autoDisabledReason) {
+      lines.push(`  Auto-disabled reason: ${autoDisabledReason}`)
+    }
+
     return lines.join('\n')
   }
 
@@ -518,14 +905,45 @@ export class SystemService {
     const k = 1024
     const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB']
     const i = Math.floor(Math.log(bytes) / Math.log(k))
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(decimals)) + ' ' + sizes[i]
+    return Number.parseFloat((bytes / Math.pow(k, i)).toFixed(decimals)) + ' ' + sizes[i]
   }
 
   async updateSetting(key: KVStoreKey, value: any): Promise<void> {
-    if ((value === '' || value === undefined || value === null) && KV_STORE_SCHEMA[key] === 'string') {
+    if (
+      (value === '' || value === undefined || value === null) &&
+      KV_STORE_SCHEMA[key] === 'string'
+    ) {
       await KVStore.clearValue(key)
     } else {
       await KVStore.setValue(key, value)
+    }
+    if (key === 'ai.assistantCustomName') {
+      invalidateAssistantNameCache()
+    }
+    // Re-enabling auto-update after a backoff-driven auto-disable clears the
+    // failure state so it gets a fresh start instead of immediately re-tripping.
+    if (key === 'autoUpdate.enabled' && (value === true || value === 'true')) {
+      await KVStore.setValue('autoUpdate.consecutiveFailures', '0')
+      await KVStore.clearValue('autoUpdate.autoDisabledReason')
+    }
+    // Re-enabling the global app auto-update master switch clears every app's
+    // per-app failure backoff so previously self-disabled apps get a fresh start.
+    if (key === 'appAutoUpdate.enabled' && (value === true || value === 'true')) {
+      await Service.query().update({
+        auto_update_consecutive_failures: 0,
+        auto_update_disabled_reason: null,
+      })
+    }
+    // Re-enabling content auto-update clears the feature-level backoff and every
+    // resource's per-resource backoff so previously self-disabled content gets a
+    // fresh start.
+    if (key === 'contentAutoUpdate.enabled' && (value === true || value === 'true')) {
+      await KVStore.setValue('contentAutoUpdate.consecutiveFailures', '0')
+      await KVStore.clearValue('contentAutoUpdate.autoDisabledReason')
+      await InstalledResource.query().update({
+        auto_update_consecutive_failures: 0,
+        auto_update_disabled_reason: null,
+      })
     }
   }
 
@@ -534,8 +952,9 @@ export class SystemService {
    * It will mark services as not installed if their corresponding containers do not exist, regardless of their running state.
    * Handles cases where a container might have been manually removed, ensuring the database reflects the actual existence of containers.
    * Containers that exist but are stopped, paused, or restarting will still be considered installed.
+   * Returns the fetched service status list so callers can reuse it without a second Docker API call.
    */
-  private async _syncContainersWithDatabase() {
+  private async _syncContainersWithDatabase(): Promise<{ service_name: string; status: string }[]> {
     try {
       const allServices = await Service.all()
       const serviceStatusList = await this.dockerService.getServicesStatus()
@@ -548,6 +967,11 @@ export class SystemService {
         if (service.installed) {
           // If marked as installed but container doesn't exist, mark as not installed
           if (!containerExists) {
+            // Exception: remote Ollama is configured without a local container — don't reset it
+            if (service.service_name === SERVICE_NAMES.OLLAMA) {
+              const remoteUrl = await KVStore.getValue('ai.remoteOllamaUrl')
+              if (remoteUrl) continue
+            }
             logger.warn(
               `Service ${service.service_name} is marked as installed but container does not exist. Marking as not installed.`
             )
@@ -567,8 +991,11 @@ export class SystemService {
           }
         }
       }
+
+      return serviceStatusList
     } catch (error) {
       logger.error('Error syncing containers with database:', error)
+      return []
     }
   }
 
@@ -621,4 +1048,82 @@ export class SystemService {
       })
   }
 
+  /**
+   * Check whether the host has enough free memory and disk to comfortably run an app.
+   * Returns an array of human-readable warning strings; an empty array means no concerns.
+   * These are advisory only — the caller decides whether to block or warn.
+   */
+  async checkResourceWarnings(minMemoryMB: number, minDiskMB: number): Promise<string[]> {
+    const warnings: string[] = []
+
+    try {
+      const mem = await si.mem()
+      const availableMB = Math.floor(mem.available / 1024 / 1024)
+      if (availableMB < minMemoryMB) {
+        warnings.push(
+          `Low memory: ${availableMB} MB available, this app recommends at least ${minMemoryMB} MB free.`
+        )
+      }
+    } catch (err: any) {
+      logger.warn(`[SystemService] checkResourceWarnings mem check failed: ${err.message}`)
+    }
+
+    try {
+      const storagePath = env.get('NOMAD_STORAGE_PATH', '/opt/project-nomad/storage')
+      const fsSizes = await si.fsSize()
+      // Find the filesystem whose mount point is the longest prefix of storagePath
+      const fs = fsSizes
+        .filter((f) => storagePath.startsWith(f.mount))
+        .sort((a, b) => b.mount.length - a.mount.length)[0]
+
+      if (fs) {
+        const availableDiskMB = Math.floor((fs.size - fs.used) / 1024 / 1024)
+        if (availableDiskMB < minDiskMB) {
+          warnings.push(
+            `Low disk space: ${availableDiskMB} MB available on ${fs.mount}, this app recommends at least ${minDiskMB} MB free.`
+          )
+        }
+      }
+    } catch (err: any) {
+      logger.warn(`[SystemService] checkResourceWarnings disk check failed: ${err.message}`)
+    }
+
+    return warnings
+  }
+
+  /**
+   * Return the next suggested host port for a custom app in the 8600+ range.
+   * Looks at existing custom service records and all Docker container port bindings.
+   */
+  async getNextSuggestedCustomPort(): Promise<number> {
+    const CUSTOM_PORT_START = 8600
+    const occupied = new Set<number>()
+
+    try {
+      // Ports used by existing custom services in the DB
+      const customServices = await Service.query().where('is_custom', true)
+      for (const svc of customServices) {
+        const config = svc.container_config ? JSON.parse(svc.container_config) : null
+        const bindings = config?.HostConfig?.PortBindings ?? {}
+        for (const binding of Object.values(bindings) as any[]) {
+          const port = parseInt(binding?.[0]?.HostPort, 10)
+          if (!isNaN(port)) occupied.add(port)
+        }
+      }
+
+      // Ports used by any running Docker container in the 8600+ range
+      const containers = await this.dockerService.docker.listContainers({ all: true })
+      for (const c of containers) {
+        for (const p of c.Ports) {
+          if (p.PublicPort && p.PublicPort >= CUSTOM_PORT_START) occupied.add(p.PublicPort)
+        }
+      }
+    } catch (err: any) {
+      logger.warn(`[SystemService] getNextSuggestedCustomPort probe failed: ${err.message}`)
+    }
+
+    let candidate = CUSTOM_PORT_START
+    while (occupied.has(candidate)) candidate += 10
+    return candidate
+  }
 }

@@ -10,13 +10,14 @@ import { useNotifications } from '~/context/NotificationContext'
 import api from '~/lib/api'
 import { useModals } from '~/context/ModalContext'
 import StyledModal from '~/components/StyledModal'
-import { ModelResponse } from 'ollama'
+import type { NomadInstalledModel } from '../../../types/ollama'
 import { SERVICE_NAMES } from '../../../constants/service_names'
 import Switch from '~/components/inputs/Switch'
 import StyledSectionHeader from '~/components/StyledSectionHeader'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import Input from '~/components/inputs/Input'
 import { IconSearch, IconRefresh } from '@tabler/icons-react'
+import { formatBytes } from '~/lib/util'
 import useDebounce from '~/hooks/useDebounce'
 import ActiveModelDownloads from '~/components/ActiveModelDownloads'
 import { useSystemInfo } from '~/hooks/useSystemInfo'
@@ -24,8 +25,8 @@ import { useSystemInfo } from '~/hooks/useSystemInfo'
 export default function ModelsPage(props: {
   models: {
     availableModels: NomadOllamaModel[]
-    installedModels: ModelResponse[]
-    settings: { chatSuggestionsEnabled: boolean; aiAssistantCustomName: string }
+    installedModels: NomadInstalledModel[]
+    settings: { chatSuggestionsEnabled: boolean; aiAssistantCustomName: string; remoteOllamaUrl: string; ollamaFlashAttention: boolean; autoThinking: boolean }
   }
 }) {
   const { aiAssistantName } = usePage<{ aiAssistantName: string }>().props
@@ -94,9 +95,50 @@ export default function ModelsPage(props: {
   const [chatSuggestionsEnabled, setChatSuggestionsEnabled] = useState(
     props.models.settings.chatSuggestionsEnabled
   )
+  const [ollamaFlashAttention, setOllamaFlashAttention] = useState(
+    props.models.settings.ollamaFlashAttention
+  )
+  const [autoThinking, setAutoThinking] = useState(props.models.settings.autoThinking)
   const [aiAssistantCustomName, setAiAssistantCustomName] = useState(
     props.models.settings.aiAssistantCustomName
   )
+  const [remoteOllamaUrl, setRemoteOllamaUrl] = useState(props.models.settings.remoteOllamaUrl)
+  const [remoteOllamaError, setRemoteOllamaError] = useState<string | null>(null)
+  const [remoteOllamaSaving, setRemoteOllamaSaving] = useState(false)
+
+  async function handleSaveRemoteOllama() {
+    setRemoteOllamaError(null)
+    setRemoteOllamaSaving(true)
+    try {
+      const res = await api.configureRemoteOllama(remoteOllamaUrl || null)
+      if (res?.success) {
+        addNotification({ message: res.message, type: 'success' })
+        router.reload()
+      }
+    } catch (error: any) {
+      const msg = error?.response?.data?.message || error?.message || 'Failed to configure remote Ollama.'
+      setRemoteOllamaError(msg)
+    } finally {
+      setRemoteOllamaSaving(false)
+    }
+  }
+
+  async function handleClearRemoteOllama() {
+    setRemoteOllamaError(null)
+    setRemoteOllamaSaving(true)
+    try {
+      const res = await api.configureRemoteOllama(null)
+      if (res?.success) {
+        setRemoteOllamaUrl('')
+        addNotification({ message: 'Remote Ollama configuration cleared.', type: 'success' })
+        router.reload()
+      }
+    } catch (error: any) {
+      setRemoteOllamaError(error?.message || 'Failed to clear remote Ollama.')
+    } finally {
+      setRemoteOllamaSaving(false)
+    }
+  }
 
   const [query, setQuery] = useState('')
   const [queryUI, setQueryUI] = useState('')
@@ -220,7 +262,7 @@ export default function ModelsPage(props: {
 
   return (
     <SettingsLayout>
-      <Head title={`${aiAssistantName} Settings | Project N.O.M.A.D.`} />
+      <Head title={`${aiAssistantName} Settings | Project NOMAD`} />
       <div className="xl:pl-72 w-full">
         <main className="px-12 py-6">
           <h1 className="text-4xl font-semibold mb-4">{aiAssistantName}</h1>
@@ -242,7 +284,7 @@ export default function ModelsPage(props: {
               type="warning"
               variant="bordered"
               title="GPU Not Accessible"
-              message={`Your system has an NVIDIA GPU, but ${aiAssistantName} can't access it. AI is running on CPU only, which is significantly slower.`}
+              message={`Your system has ${systemInfo?.gpuHealth?.gpuVendor === 'amd' ? 'an AMD' : 'an NVIDIA'} GPU, but ${aiAssistantName} can't access it. AI is running on CPU only, which is significantly slower.`}
               className="!mt-6"
               dismissible={true}
               onDismiss={handleDismissGpuBanner}
@@ -270,6 +312,24 @@ export default function ModelsPage(props: {
                 label="Chat Suggestions"
                 description="Display AI-generated conversation starters in the chat interface"
               />
+              <Switch
+                checked={ollamaFlashAttention}
+                onChange={(newVal) => {
+                  setOllamaFlashAttention(newVal)
+                  updateSettingMutation.mutate({ key: 'ai.ollamaFlashAttention', value: newVal })
+                }}
+                label="Flash Attention"
+                description="Enables OLLAMA_FLASH_ATTENTION=1 for improved memory efficiency. Disable if you experience instability. Takes effect after reinstalling the AI Assistant."
+              />
+              <Switch
+                checked={autoThinking}
+                onChange={(newVal) => {
+                  setAutoThinking(newVal)
+                  updateSettingMutation.mutate({ key: 'ai.autoThinking', value: newVal })
+                }}
+                label="Use thinking automatically when a model supports it"
+                description="Sets the default for models that can think. You can still turn thinking on or off for an individual model in the chat window."
+              />
               <Input
                 name="aiAssistantCustomName"
                 label="Assistant Name"
@@ -286,9 +346,119 @@ export default function ModelsPage(props: {
               />
             </div>
           </div>
+
+          <StyledSectionHeader title="Installed Models" className="mt-12 mb-4" />
+          <div className="bg-surface-primary rounded-lg border-2 border-border-subtle p-6">
+            {props.models.installedModels.length === 0 ? (
+              <p className="text-text-muted">
+                No models installed. Browse the model catalog below to get started.
+              </p>
+            ) : (
+              <table className="min-w-full divide-y divide-border-subtle">
+                <thead>
+                  <tr>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-text-muted uppercase tracking-wider">
+                      Model
+                    </th>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-text-muted uppercase tracking-wider">
+                      Parameters
+                    </th>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-text-muted uppercase tracking-wider">
+                      Disk Size
+                    </th>
+                    <th className="px-4 py-3 text-right text-xs font-medium text-text-muted uppercase tracking-wider">
+                      Action
+                    </th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-border-subtle">
+                  {props.models.installedModels.map((model) => (
+                    <tr key={model.name} className="hover:bg-surface-secondary">
+                      <td className="px-4 py-3">
+                        <span className="text-sm font-medium text-text-primary">{model.name}</span>
+                      </td>
+                      <td className="px-4 py-3">
+                        <span className="text-sm text-text-secondary">
+                          {model.details?.parameter_size || 'N/A'}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3">
+                        <span className="text-sm text-text-secondary">
+                          {formatBytes(model.size)}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3 text-right">
+                        <StyledButton
+                          variant="danger"
+                          size="sm"
+                          onClick={() => confirmDeleteModel(model.name)}
+                          icon="IconTrash"
+                        >
+                          Delete
+                        </StyledButton>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+
+          <StyledSectionHeader title="Remote Connection" className="mt-8 mb-4" />
+          <div className="bg-surface-primary rounded-lg border-2 border-border-subtle p-6">
+            <p className="text-sm text-text-secondary mb-4">
+              Connect to any OpenAI-compatible API server — Ollama, LM Studio, llama.cpp, and others are all supported.
+              For remote Ollama instances, the host must be started with <code className="bg-surface-secondary px-1 rounded">OLLAMA_HOST=0.0.0.0</code>.
+            </p>
+            <div className="flex items-end gap-3">
+              <div className="flex-1">
+                <Input
+                  name="remoteOllamaUrl"
+                  label="Remote Ollama/OpenAI API URL"
+                  placeholder="http://192.168.1.100:11434  (or :1234 for OpenAI API Compatible Apps)"
+                  value={remoteOllamaUrl}
+                  onChange={(e) => {
+                    setRemoteOllamaUrl(e.target.value)
+                    setRemoteOllamaError(null)
+                  }}
+                />
+                {remoteOllamaError && (
+                  <p className="text-sm text-red-600 mt-1">{remoteOllamaError}</p>
+                )}
+              </div>
+              <StyledButton
+                variant="primary"
+                onClick={handleSaveRemoteOllama}
+                loading={remoteOllamaSaving}
+                disabled={remoteOllamaSaving || !remoteOllamaUrl}
+                className="mb-0.5"
+              >
+                Save &amp; Test
+              </StyledButton>
+              {props.models.settings.remoteOllamaUrl && (
+                <StyledButton
+                  variant="danger"
+                  onClick={handleClearRemoteOllama}
+                  loading={remoteOllamaSaving}
+                  disabled={remoteOllamaSaving}
+                  className="mb-0.5"
+                >
+                  Clear
+                </StyledButton>
+              )}
+            </div>
+          </div>
+
           <ActiveModelDownloads withHeader />
 
           <StyledSectionHeader title="Models" className="mt-12 mb-4" />
+          <Alert
+            type="info"
+            variant="bordered"
+            title="Model downloading is only supported when using a Ollama backend."
+            message="If you are connected to an OpenAI API host (e.g. LM Studio), please download models directly in that application."
+            className="mb-4"
+          />
           <div className="flex justify-start items-center gap-3 mt-4">
             <Input
               name="search"

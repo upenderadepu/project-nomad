@@ -1,10 +1,12 @@
 import { Archive, Entry } from '@openzim/libzim'
 import * as cheerio from 'cheerio'
 import { HTML_SELECTORS_TO_REMOVE, NON_CONTENT_HEADING_PATTERNS } from '../../constants/zim_extraction.js'
+import { extractStructuredContent } from '../utils/zim_html.js'
 import logger from '@adonisjs/core/services/logger'
 import { ExtractZIMChunkingStrategy, ExtractZIMContentOptions, ZIMContentChunk, ZIMArchiveMetadata } from '../../types/zim.js'
 import { randomUUID } from 'node:crypto'
 import { access } from 'node:fs/promises'
+import { isValidZimFile } from '../utils/fs.js'
 
 export class ZIMExtractionService {
 
@@ -39,7 +41,10 @@ export class ZIMExtractionService {
      * @param filePath - Path to the ZIM file
      * @param opts - Options including maxArticles, strategy, onProgress, startOffset, and batchSize
      */
-    async extractZIMContent(filePath: string, opts: ExtractZIMContentOptions = {}): Promise<ZIMContentChunk[]> {
+    async extractZIMContent(
+        filePath: string,
+        opts: ExtractZIMContentOptions = {}
+    ): Promise<{ chunks: ZIMContentChunk[]; totalArticles: number }> {
         try {
             logger.info(`[ZIMExtractionService]: Processing ZIM file at path: ${filePath}`)
             
@@ -51,7 +56,13 @@ export class ZIMExtractionService {
                 logger.error(`[ZIMExtractionService]: ZIM file not accessible: ${filePath}`)
                 throw new Error(`ZIM file not found or not accessible: ${filePath}`)
             }
-            
+
+            // Validate ZIM magic number before opening with native library.
+            // A corrupted file causes a native C++ abort that cannot be caught by JS.
+            if (!(await isValidZimFile(filePath))) {
+                throw new Error(`ZIM file is invalid or corrupted: ${filePath}`)
+            }
+
             const archive = new Archive(filePath)
 
             // Extract archive-level metadata once
@@ -105,7 +116,7 @@ export class ZIMExtractionService {
                 let chunks: ZIMContentChunk[]
 
                 if (strategy === 'structured') {
-                    const structured = this.extractStructuredContent(html)
+                    const structured = extractStructuredContent(html)
                     chunks = structured.sections.map(s => ({
                         text: s.text,
                         articleTitle,
@@ -154,7 +165,7 @@ export class ZIMExtractionService {
                 textPreview: c.text.substring(0, 100)
             })))
             logger.debug("Total structured sections extracted:", toReturn.length)
-            return toReturn
+            return { chunks: toReturn, totalArticles: archive.articleCount }
         } catch (error) {
             logger.error('Error processing ZIM file:', error)
             throw error
@@ -198,59 +209,6 @@ export class ZIMExtractionService {
             logger.error('Error extracting text from HTML:', error)
             return null
         }
-    }
-
-    private extractStructuredContent(html: string) {
-        const $ = cheerio.load(html);
-
-        const title = $('h1').first().text().trim() || $('title').text().trim();
-
-        // Extract sections with their headings and heading levels
-        const sections: Array<{ heading: string; text: string; level: number }> = [];
-        let currentSection = { heading: 'Introduction', content: [] as string[], level: 2 };
-
-        $('body').children().each((_, element) => {
-            const $el = $(element);
-            const tagName = element.tagName?.toLowerCase();
-
-            if (['h2', 'h3', 'h4'].includes(tagName)) {
-                // Save current section if it has content
-                if (currentSection.content.length > 0) {
-                    sections.push({
-                        heading: currentSection.heading,
-                        text: currentSection.content.join(' ').replace(/\s+/g, ' ').trim(),
-                        level: currentSection.level,
-                    });
-                }
-                // Start new section
-                const level = parseInt(tagName.substring(1)); // Extract number from h2, h3, h4
-                currentSection = {
-                    heading: $el.text().replace(/\[edit\]/gi, '').trim(),
-                    content: [],
-                    level,
-                };
-            } else if (['p', 'ul', 'ol', 'dl', 'table'].includes(tagName)) {
-                const text = $el.text().trim();
-                if (text.length > 0) {
-                    currentSection.content.push(text);
-                }
-            }
-        });
-
-        // Push the last section if it has content
-        if (currentSection.content.length > 0) {
-            sections.push({
-                heading: currentSection.heading,
-                text: currentSection.content.join(' ').replace(/\s+/g, ' ').trim(),
-                level: currentSection.level,
-            });
-        }
-
-        return {
-            title,
-            sections,
-            fullText: sections.map(s => `${s.heading}\n${s.text}`).join('\n\n'),
-        };
     }
 
     private hasStructuredHeadings(html: string): boolean {

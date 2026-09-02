@@ -11,6 +11,15 @@ export const chatSchema = vine.compile(
     ),
     stream: vine.boolean().optional(),
     sessionId: vine.number().positive().optional(),
+    // Effective per-request thinking preference (per-model override or global default),
+    // resolved client-side. Omitted -> server falls back to the ai.autoThinking KV default.
+    think: vine.boolean().optional(),
+  })
+)
+
+export const unloadChatModelsSchema = vine.compile(
+  vine.object({
+    targetModel: vine.string().trim().minLength(1).nullable().optional(),
   })
 )
 

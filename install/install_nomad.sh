@@ -1,10 +1,10 @@
 #!/bin/bash
 
-# Project N.O.M.A.D. Installation Script
+# Project NOMAD Installation Script
 
 ###################################################################################################################################################################################################
 
-# Script                | Project N.O.M.A.D. Installation Script
+# Script                | Project NOMAD Installation Script
 # Version               | 1.0.0
 # Author                | Crosstalk Solutions, LLC
 # Website               | https://crosstalksolutions.com
@@ -28,11 +28,9 @@ GREEN='\033[1;32m' # Light Green.
 #                                                                                                                                                                                                 #
 ###################################################################################################################################################################################################
 
-WHIPTAIL_TITLE="Project N.O.M.A.D Installation"
+WHIPTAIL_TITLE="Project NOMAD Installation"
 NOMAD_DIR="/opt/project-nomad"
 MANAGEMENT_COMPOSE_FILE_URL="https://raw.githubusercontent.com/Crosstalk-Solutions/project-nomad/refs/heads/main/install/management_compose.yaml"
-SIDECAR_UPDATER_DOCKERFILE_URL="https://raw.githubusercontent.com/Crosstalk-Solutions/project-nomad/refs/heads/main/install/sidecar-updater/Dockerfile"
-SIDECAR_UPDATER_SCRIPT_URL="https://raw.githubusercontent.com/Crosstalk-Solutions/project-nomad/refs/heads/main/install/sidecar-updater/update-watcher.sh"
 START_SCRIPT_URL="https://raw.githubusercontent.com/Crosstalk-Solutions/project-nomad/refs/heads/main/install/start_nomad.sh"
 STOP_SCRIPT_URL="https://raw.githubusercontent.com/Crosstalk-Solutions/project-nomad/refs/heads/main/install/stop_nomad.sh"
 UPDATE_SCRIPT_URL="https://raw.githubusercontent.com/Crosstalk-Solutions/project-nomad/refs/heads/main/install/update_nomad.sh"
@@ -88,12 +86,32 @@ check_is_debian_based() {
     echo -e "${GREEN}#${RESET} This script is running on a Debian-based system.\\n"
 }
 
+check_is_x86_64() {
+  local arch
+  arch="$(uname -m)"
+  if [[ "${arch}" != "x86_64" && "${arch}" != "amd64" ]]; then
+    echo -e "${YELLOW}#${RESET} WARNING: Detected architecture '${arch}'. NOMAD officially supports x86_64 only.\\n"
+    echo -e "${YELLOW}#${RESET} ARM64/aarch64 support is tracked in PR #419 and is not yet ready.\\n"
+    echo -e "${YELLOW}#${RESET} Continuing on an unsupported architecture will likely fail and may leave\\n"
+    echo -e "${YELLOW}#${RESET} partial Docker images and files behind that you'll need to clean up manually.\\n"
+    echo -e "${YELLOW}#${RESET} Continuing in 10 seconds... press Ctrl+C now to abort.\\n"
+    sleep 10
+    return
+  fi
+  echo -e "${GREEN}#${RESET} Architecture check passed (${arch}).\\n"
+}
+
 ensure_dependencies_installed() {
   local missing_deps=()
 
   # Check for curl
   if ! command -v curl &> /dev/null; then
     missing_deps+=("curl")
+  fi
+
+  # Check for gpg (required for NVIDIA container toolkit keyring)
+  if ! command -v gpg &> /dev/null; then
+    missing_deps+=("gpg")
   fi
 
   # Check for whiptail (used for dialogs, though not currently active)
@@ -246,7 +264,7 @@ setup_nvidia_container_toolkit() {
   echo -e "${YELLOW}#${RESET} Installing NVIDIA container toolkit...\\n"
   
   # Install dependencies per https://docs.ollama.com/docker - wrapped in error handling
-  if ! curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey 2>/dev/null | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg 2>/dev/null; then
+  if ! curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey 2>/dev/null | sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg 2>/dev/null; then
     echo -e "${YELLOW}#${RESET} Warning: Failed to add NVIDIA container toolkit GPG key. Continuing anyway...\\n"
     return 0
   fi
@@ -335,8 +353,8 @@ setup_nvidia_container_toolkit() {
 }
 
 get_install_confirmation(){
-  echo -e "${YELLOW}#${RESET} This script will install Project N.O.M.A.D. and its dependencies on your machine."
-  echo -e "${YELLOW}#${RESET} If you already have Project N.O.M.A.D. installed with customized config or data, please be aware that running this installation script may overwrite existing files and configurations. It is highly recommended to back up any important data/configs before proceeding."
+  echo -e "${YELLOW}#${RESET} This script will install Project NOMAD and its dependencies on your machine."
+  echo -e "${YELLOW}#${RESET} If you already have Project NOMAD installed with customized config or data, please be aware that running this installation script may overwrite existing files and configurations. It is highly recommended to back up any important data/configs before proceeding."
   read -p "Are you sure you want to continue? (y/N): " choice
   case "$choice" in
     y|Y )
@@ -354,9 +372,9 @@ accept_terms() {
   echo "License Agreement & Terms of Use"
   echo "__________________________"
   printf "\n\n"
-  echo "Project N.O.M.A.D. is licensed under the Apache License 2.0. The full license can be found at https://www.apache.org/licenses/LICENSE-2.0 or in the LICENSE file of this repository."
+  echo "Project NOMAD is licensed under the Apache License 2.0. The full license can be found at https://www.apache.org/licenses/LICENSE-2.0 or in the LICENSE file of this repository."
   printf "\n"
-  echo "By accepting this agreement, you acknowledge that you have read and understood the terms and conditions of the Apache License 2.0 and agree to be bound by them while using Project N.O.M.A.D."
+  echo "By accepting this agreement, you acknowledge that you have read and understood the terms and conditions of the Apache License 2.0 and agree to be bound by them while using Project NOMAD"
   echo -e "\n\n"
   read -p "I have read and accept License Agreement & Terms of Use (y/N)? " choice
   case "$choice" in
@@ -373,7 +391,7 @@ accept_terms() {
 create_nomad_directory(){
   # Ensure the main installation directory exists
   if [[ ! -d "$NOMAD_DIR" ]]; then
-    echo -e "${YELLOW}#${RESET} Creating directory for Project N.O.M.A.D at $NOMAD_DIR...\\n"
+    echo -e "${YELLOW}#${RESET} Creating directory for Project NOMAD at $NOMAD_DIR...\\n"
     sudo mkdir -p "$NOMAD_DIR"
     sudo chown "$(whoami):$(whoami)" "$NOMAD_DIR"
 
@@ -403,6 +421,15 @@ download_management_compose_file() {
   local db_root_password=$(generateRandomPass)
   local db_user_password=$(generateRandomPass)
 
+  # If MySQL data directory exists from a previous install attempt, remove it.
+  # MySQL only initializes credentials on first startup when the data dir is empty.
+  # If stale data exists, MySQL ignores the new passwords above and uses the old ones,
+  # causing "Access denied" errors when the admin container tries to connect.
+  if [[ -d "${NOMAD_DIR}/mysql" ]]; then
+    echo -e "${YELLOW}#${RESET} Removing existing MySQL data directory to ensure credentials match...\\n"
+    sudo rm -rf "${NOMAD_DIR}/mysql"
+  fi
+
   # Inject dynamic env values into the compose file
   echo -e "${YELLOW}#${RESET} Configuring docker-compose file env variables...\\n"
   sed -i "s|URL=replaceme|URL=http://${local_ip_address}:8080|g" "$compose_file_path"
@@ -415,51 +442,25 @@ download_management_compose_file() {
   echo -e "${GREEN}#${RESET} Docker compose file configured successfully.\\n"
 }
 
-download_sidecar_files() {
-  # Create sidecar-updater directory if it doesn't exist
-  if [[ ! -d "${NOMAD_DIR}/sidecar-updater" ]]; then
-    sudo mkdir -p "${NOMAD_DIR}/sidecar-updater"
-    sudo chown "$(whoami):$(whoami)" "${NOMAD_DIR}/sidecar-updater"
-  fi
-
-  local sidecar_dockerfile_path="${NOMAD_DIR}/sidecar-updater/Dockerfile"
-  local sidecar_script_path="${NOMAD_DIR}/sidecar-updater/update-watcher.sh"
-
-  echo -e "${YELLOW}#${RESET} Downloading sidecar updater Dockerfile...\\n"
-  if ! curl -fsSL "$SIDECAR_UPDATER_DOCKERFILE_URL" -o "$sidecar_dockerfile_path"; then
-    echo -e "${RED}#${RESET} Failed to download the sidecar updater Dockerfile. Please check the URL and try again."
-    exit 1
-  fi
-  echo -e "${GREEN}#${RESET} Sidecar updater Dockerfile downloaded successfully to $sidecar_dockerfile_path.\\n"
-
-  echo -e "${YELLOW}#${RESET} Downloading sidecar updater script...\\n"
-  if ! curl -fsSL "$SIDECAR_UPDATER_SCRIPT_URL" -o "$sidecar_script_path"; then
-    echo -e "${RED}#${RESET} Failed to download the sidecar updater script. Please check the URL and try again."
-    exit 1
-  fi
-  chmod +x "$sidecar_script_path"
-  echo -e "${GREEN}#${RESET} Sidecar updater script downloaded successfully to $sidecar_script_path.\\n"
-}
-
 download_helper_scripts() {
   local start_script_path="${NOMAD_DIR}/start_nomad.sh"
   local stop_script_path="${NOMAD_DIR}/stop_nomad.sh"
   local update_script_path="${NOMAD_DIR}/update_nomad.sh"
 
   echo -e "${YELLOW}#${RESET} Downloading helper scripts...\\n"
-  if ! curl -fsSL "$START_SCRIPT_URL" -o "$start_script_path"; then
+  if ! curl -fsSL --retry 5 --retry-delay 3 "$START_SCRIPT_URL" -o "$start_script_path"; then
     echo -e "${RED}#${RESET} Failed to download the start script. Please check the URL and try again."
     exit 1
   fi
   chmod +x "$start_script_path"
 
-  if ! curl -fsSL "$STOP_SCRIPT_URL" -o "$stop_script_path"; then
+  if ! curl -fsSL --retry 5 --retry-delay 3 "$STOP_SCRIPT_URL" -o "$stop_script_path"; then
     echo -e "${RED}#${RESET} Failed to download the stop script. Please check the URL and try again."
     exit 1
   fi
   chmod +x "$stop_script_path"
 
-  if ! curl -fsSL "$UPDATE_SCRIPT_URL" -o "$update_script_path"; then
+  if ! curl -fsSL --retry 5 --retry-delay 3 "$UPDATE_SCRIPT_URL" -o "$update_script_path"; then
     echo -e "${RED}#${RESET} Failed to download the update script. Please check the URL and try again."
     exit 1
   fi
@@ -510,27 +511,89 @@ verify_gpu_setup() {
   fi
   
   # Check if Docker has NVIDIA runtime
-  if docker info 2>/dev/null | grep -q \"nvidia\"; then
+  if docker info 2>/dev/null | grep -q "nvidia"; then
     echo -e "${GREEN}✓${RESET} Docker NVIDIA runtime configured\\n"
   else
     echo -e "${YELLOW}○${RESET} Docker NVIDIA runtime not detected\\n"
   fi
   
-  # Check for AMD GPU
+  # Check for AMD GPU — restrict to display controller classes to avoid false positives
+  # from AMD CPU host bridges, PCI bridges, and chipset devices.
+  local has_amd_gpu='false'
+  local amd_gfx_version=''
   if command -v lspci &> /dev/null; then
-    if lspci 2>/dev/null | grep -iE "amd|radeon" &> /dev/null; then
-      echo -e "${YELLOW}○${RESET} AMD GPU detected (ROCm support not currently available)\\n"
+    if lspci 2>/dev/null | grep -iE "VGA|3D controller|Display" | grep -iE "amd|radeon" &> /dev/null; then
+      has_amd_gpu='true'
+      echo -e "${GREEN}✓${RESET} AMD GPU detected — ROCm acceleration will be configured automatically when AI Assistant is installed.\\n"
+
+      # Map AMD codename → gfx version so the admin can pick the right HSA_OVERRIDE_GFX_VERSION.
+      # gfx1030/1100/1101/1102 are on AMD's official ROCm allowlist and need NO override —
+      # forcing one (e.g. 11.0.0) breaks GPU discovery on these. Other variants do need it.
+      local amd_devices
+      amd_devices=$(lspci -vmm 2>/dev/null | awk -F'\t' '/^Class:.*(VGA|3D|Display)/{c=1} c && /^Device:/{print $2; c=0}')
+      if echo "${amd_devices}" | grep -iq 'Navi 21'; then
+        amd_gfx_version='gfx1030'
+      elif echo "${amd_devices}" | grep -iq 'Navi 22'; then
+        amd_gfx_version='gfx1031'
+      elif echo "${amd_devices}" | grep -iq 'Navi 23'; then
+        amd_gfx_version='gfx1032'
+      elif echo "${amd_devices}" | grep -iq 'Navi 24'; then
+        amd_gfx_version='gfx1034'
+      elif echo "${amd_devices}" | grep -iq 'Rembrandt'; then
+        amd_gfx_version='gfx1035'
+      elif echo "${amd_devices}" | grep -iEq 'Phoenix[0-9]?|Hawk Point|Radeon (780M|760M)'; then
+        # Phoenix (Ryzen 7040) / Hawk Point (Ryzen 8040) — 780M & 760M are both gfx1103.
+        # lspci device strings vary (Phoenix1/Phoenix2/Phoenix3, "Hawk Point", or the bare
+        # "Radeon 780M Graphics" marketing name), so match all of them or the marker goes
+        # missing and the 780M silently drops to CPU. Kept before the Strix branches so a
+        # "Radeon 780M" string can't be miscaught. See gfx1103 regression.
+        amd_gfx_version='gfx1103'
+      elif echo "${amd_devices}" | grep -iEq 'Strix Halo'; then
+        amd_gfx_version='gfx1151'
+      elif echo "${amd_devices}" | grep -iEq 'Strix( Point)?'; then
+        amd_gfx_version='gfx1150'
+      elif echo "${amd_devices}" | grep -iq 'Navi 31'; then
+        amd_gfx_version='gfx1100'
+      elif echo "${amd_devices}" | grep -iq 'Navi 32'; then
+        amd_gfx_version='gfx1101'
+      elif echo "${amd_devices}" | grep -iq 'Navi 33'; then
+        amd_gfx_version='gfx1102'
+      fi
     fi
   fi
-  
+
+  # Write detected GPU type to a marker file the admin container can read. The admin
+  # container lacks lspci and AMD GPUs don't register a Docker runtime, so this is the
+  # only reliable way for the admin to know an AMD GPU is present at install time.
+  local gpu_marker_path="${NOMAD_DIR}/storage/.nomad-gpu-type"
+  if command -v nvidia-smi &> /dev/null; then
+    echo 'nvidia' | sudo tee "${gpu_marker_path}" > /dev/null 2>&1 || true
+  elif [[ "${has_amd_gpu}" == 'true' ]]; then
+    echo 'amd' | sudo tee "${gpu_marker_path}" > /dev/null 2>&1 || true
+  else
+    sudo rm -f "${gpu_marker_path}" 2>/dev/null || true
+  fi
+
+  # Companion marker used by the admin to pick the right HSA_OVERRIDE_GFX_VERSION for
+  # the detected card. Absence of this file means "unknown gfx" — the admin falls back
+  # to its built-in default. Always rewrite (or remove) on install to keep state fresh.
+  local amd_gfx_marker_path="${NOMAD_DIR}/storage/.nomad-amd-gfx"
+  if [[ -n "${amd_gfx_version}" ]]; then
+    echo "${amd_gfx_version}" | sudo tee "${amd_gfx_marker_path}" > /dev/null 2>&1 || true
+  else
+    sudo rm -f "${amd_gfx_marker_path}" 2>/dev/null || true
+  fi
+
   echo -e "${YELLOW}===========================================${RESET}\\n"
-  
+
   # Summary
-  if command -v nvidia-smi &> /dev/null && docker info 2>/dev/null | grep -q \"nvidia\"; then
+  if command -v nvidia-smi &> /dev/null && docker info 2>/dev/null | grep -q "nvidia"; then
     echo -e "${GREEN}#${RESET} GPU acceleration is properly configured! The AI Assistant will use your GPU.\\n"
+  elif [[ "${has_amd_gpu}" == 'true' ]]; then
+    echo -e "${GREEN}#${RESET} GPU acceleration will be enabled (AMD/ROCm) when AI Assistant is installed from the dashboard.\\n"
   else
     echo -e "${YELLOW}#${RESET} GPU acceleration not detected. The AI Assistant will run in CPU-only mode.\\n"
-    if command -v nvidia-smi &> /dev/null && ! docker info 2>/dev/null | grep -q \"nvidia\"; then
+    if command -v nvidia-smi &> /dev/null && ! docker info 2>/dev/null | grep -q "nvidia"; then
       echo -e "${YELLOW}#${RESET} Tip: Your GPU is detected but Docker runtime is not configured.\\n"
       echo -e "${YELLOW}#${RESET} Try restarting Docker: ${WHITE_R}sudo systemctl restart docker${RESET}\\n"
     fi
@@ -538,11 +601,11 @@ verify_gpu_setup() {
 }
 
 success_message() {
-  echo -e "${GREEN}#${RESET} Project N.O.M.A.D installation completed successfully!\\n"
+  echo -e "${GREEN}#${RESET} Project NOMAD installation completed successfully!\\n"
   echo -e "${GREEN}#${RESET} Installation files are located at /opt/project-nomad\\n\n"
-  echo -e "${GREEN}#${RESET} Project N.O.M.A.D's Command Center should automatically start whenever your device reboots. However, if you need to start it manually, you can always do so by running: ${WHITE_R}${NOMAD_DIR}/start_nomad.sh${RESET}\\n"
+  echo -e "${GREEN}#${RESET} Project NOMAD's Command Center should automatically start whenever your device reboots. However, if you need to start it manually, you can always do so by running: ${WHITE_R}${NOMAD_DIR}/start_nomad.sh${RESET}\\n"
   echo -e "${GREEN}#${RESET} You can now access the management interface at http://localhost:8080 or http://${local_ip_address}:8080\\n"
-  echo -e "${GREEN}#${RESET} Thank you for supporting Project N.O.M.A.D!\\n"
+  echo -e "${GREEN}#${RESET} Thank you for supporting Project NOMAD!\\n"
 }
 
 ###################################################################################################################################################################################################
@@ -553,6 +616,7 @@ success_message() {
 
 # Pre-flight checks
 check_is_debian_based
+check_is_x86_64
 check_is_bash
 check_has_sudo
 ensure_dependencies_installed
@@ -566,7 +630,6 @@ check_docker_compose
 setup_nvidia_container_toolkit
 get_local_ip
 create_nomad_directory
-download_sidecar_files
 download_helper_scripts
 download_management_compose_file
 start_management_containers

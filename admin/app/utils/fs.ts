@@ -1,10 +1,27 @@
-import { mkdir, readdir, readFile, stat, unlink } from 'fs/promises'
+import { mkdir, open, readdir, readFile, stat, unlink } from 'fs/promises'
 import path, { join } from 'path'
 import { FileEntry } from '../../types/files.js'
 import { createReadStream } from 'fs'
 import { LSBlockDevice, NomadDiskInfoRaw } from '../../types/system.js'
 
 export const ZIM_STORAGE_PATH = '/storage/zim'
+export const KIWIX_LIBRARY_XML_PATH = '/storage/zim/kiwix-library.xml'
+export const BOOKS_STORAGE_PATH = '/storage/books'
+// Shared media root (Jellyfin reads it as /media; File Browser shows it as "media"). Per-type
+// subfolders are pre-created on Jellyfin install — see _runPreinstallActions__Jellyfin.
+export const MEDIA_STORAGE_PATH = '/storage/media'
+export const JELLYFIN_MEDIA_SUBFOLDERS = ['Movies', 'TV Shows', 'Music', 'Photos']
+// Empty Calibre library bundled into the admin image (see install/calibre-empty-library/).
+// Seeded into storage/books on Calibre-Web install so it doesn't dead-end at db config.
+export const CALIBRE_EMPTY_LIBRARY_ASSET_PATH = 'assets/calibre/metadata.db'
+// Vaultwarden's /data volume. A self-signed TLS cert is generated here on install so the
+// web vault has the secure context (HTTPS) it requires — see _runPreinstallActions__Vaultwarden.
+export const VAULTWARDEN_STORAGE_PATH = '/storage/vaultwarden'
+// MeshCore Web's working dir. On install a self-signed cert (certs/) and an SSL nginx config
+// (nginx-ssl.conf) are generated here, then bind-mounted into the container so the static client is
+// served over HTTPS — required for its Web Bluetooth/Serial connections. See
+// _runPreinstallActions__MeshCoreWeb.
+export const MESHCORE_WEB_STORAGE_PATH = '/storage/meshcore-web'
 
 export async function listDirectoryContents(path: string): Promise<FileEntry[]> {
   const entries = await readdir(path, { withFileTypes: true })
@@ -49,7 +66,7 @@ export async function listDirectoryContentsRecursive(path: string): Promise<File
 export async function ensureDirectoryExists(path: string): Promise<void> {
   try {
     await stat(path)
-  } catch (error) {
+  } catch (error: any) {
     if (error.code === 'ENOENT') {
       await mkdir(path, { recursive: true })
     }
@@ -73,7 +90,7 @@ export async function getFile(
       return createReadStream(path)
     }
     return await readFile(path)
-  } catch (error) {
+  } catch (error: any) {
     if (error.code === 'ENOENT') {
       return null
     }
@@ -90,7 +107,7 @@ export async function getFileStatsIfExists(
       size: stats.size,
       modifiedTime: stats.mtime,
     }
-  } catch (error) {
+  } catch (error: any) {
     if (error.code === 'ENOENT') {
       return null
     }
@@ -98,10 +115,32 @@ export async function getFileStatsIfExists(
   }
 }
 
+/**
+ * Validates that a file has the ZIM magic number (0x44D495A).
+ * Must be called before passing a file to @openzim/libzim Archive,
+ * because a corrupted ZIM causes a native C++ abort that cannot be
+ * caught by JS try/catch.
+ */
+export async function isValidZimFile(filePath: string): Promise<boolean> {
+  let fh
+  try {
+    fh = await open(filePath, 'r')
+    const buf = Buffer.alloc(4)
+    const { bytesRead } = await fh.read(buf, 0, 4, 0)
+    if (bytesRead < 4) return false
+    // ZIM magic number: 72 17 32 04 (little-endian 0x044D4953)
+    return buf[0] === 0x5a && buf[1] === 0x49 && buf[2] === 0x4d && buf[3] === 0x04
+  } catch {
+    return false
+  } finally {
+    await fh?.close()
+  }
+}
+
 export async function deleteFileIfExists(path: string): Promise<void> {
   try {
     await unlink(path)
-  } catch (error) {
+  } catch (error: any) {
     if (error.code !== 'ENOENT') {
       throw error
     }
@@ -151,14 +190,18 @@ export function matchesDevice(fsPath: string, deviceName: string): boolean {
   return false
 }
 
-export function determineFileType(filename: string): 'image' | 'pdf' | 'text' | 'zim' | 'unknown' {
+export function determineFileType(filename: string): 'image' | 'pdf' | 'text' | 'docx' | 'epub' | 'zim' | 'unknown' {
   const ext = path.extname(filename).toLowerCase()
   if (['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp'].includes(ext)) {
     return 'image'
   } else if (ext === '.pdf') {
     return 'pdf'
-  } else if (['.txt', '.md', '.docx', '.rtf'].includes(ext)) {
+  } else if (ext === '.docx') {
+    return 'docx'
+  } else if (['.txt', '.md', '.rtf'].includes(ext)) {
     return 'text'
+  } else if (ext === '.epub') {
+    return 'epub'
   } else if (ext === '.zim') {
     return 'zim'
   } else {

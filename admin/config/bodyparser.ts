@@ -41,13 +41,13 @@ const bodyParserConfig = defineConfig({
      */
     autoProcess: true,
     convertEmptyStringsToNull: true,
-    processManually: [],
+    processManually: ['/api/zim/upload'],
 
     /**
      * Maximum limit of data to parse including all files
      * and fields
      */
-    limit: '20mb',
+    limit: '110mb', // Set to 110MB to allow for some overhead beyond the 100MB file size limit
     types: ['multipart/form-data'],
   },
 })
